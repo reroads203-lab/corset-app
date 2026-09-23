@@ -1,0 +1,5 @@
+out/
+*.DAT
+*.bin
+*.lz
+__pycache__/
