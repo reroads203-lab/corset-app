@@ -8,9 +8,8 @@ Stdlib only. Steps:
   4. Parse the partition table the boot loader reads from flash 0x120000.
   5. Write every partition to OUTDIR/regions/ and a memory map to OUTDIR/memory_map.json.
 
-Compressed partitions (flag == 1) are written as-is together with their
-parsed compression header; the format is decoded by an on-chip hardware
-engine and is not implemented here.
+Compressed partitions (flag == 1) are decompressed with x100f_lzss and written
+to their load address; the raw .lz blob is kept alongside for reference.
 
 usage: x100f_unpack.py FPUPDATE.DAT OUTDIR
 """
@@ -18,6 +17,8 @@ import json
 import os
 import struct
 import sys
+
+from x100f_lzss import decompress as lzss_decompress
 
 CODE_SIZE = {1: 64, 2: 128, 3: 512, 4: 512, 5: 512, 6: 512, 8: 512}
 FLASH_BASE = 0xF0000000
@@ -114,12 +115,21 @@ def main():
         blob = flash(payload, p["flash_off"], p["flash_size"])
         if p["compressed"]:
             p["comp_header"] = parse_comp_header(blob)
-            blob = blob[:p["comp_header"]["compressed_size"]]
-            fn = f"{p['id']}_{p['name']}_flash{p['flash_off']:07x}.lz"
-        else:
-            # Region data starts at the partition's flash offset; the load address maps to it.
-            blob = blob[:p["size"]]
+            lz = blob[:p["comp_header"]["compressed_size"]]
+            # Decompress to the region's load address (format solved; see x100f_lzss.py).
+            data, _ = lzss_decompress(lz)
+            p["decompressed_size"] = len(data)
             fn = f"{p['id']}_{p['name']}_{p['load']:08x}.bin"
+            open(os.path.join(out, "regions", fn), "wb").write(data)
+            # Keep the raw compressed blob too, for reference.
+            lzfn = f"{p['id']}_{p['name']}_flash{p['flash_off']:07x}.lz"
+            open(os.path.join(out, "regions", lzfn), "wb").write(lz)
+            p["file"] = f"regions/{fn}"
+            p["lz_file"] = f"regions/{lzfn}"
+            continue
+        # Region data starts at the partition's flash offset; the load address maps to it.
+        blob = blob[:p["size"]]
+        fn = f"{p['id']}_{p['name']}_{p['load']:08x}.bin"
         open(os.path.join(out, "regions", fn), "wb").write(blob)
         p["file"] = f"regions/{fn}"
 

@@ -74,11 +74,9 @@ mem = currentProgram.getMemory()
 add_block(mem, "boot_stage1", 0, os.path.join(out, mm["boot_stage1"]["file"]))
 for p in mm["partitions"]:
     pid, load = p["id"], p["load"]
-    if pid in (0, 3, 4):
+    # ID5/ID6 are decompressed by x100f_unpack (format solved), so load the real bytes.
+    if pid in (0, 3, 4, 5, 6):
         add_block(mem, p["name"], load, os.path.join(out, p["file"]))
-    elif pid in (5, 6):
-        # compressed on flash; code + bss occupy [load, end + bss)
-        add_block(mem, p["name"] + "_unavailable", load, size=p["end"] + p["bss"] - load)
 add_block(mem, "hwdec_regs", 0xFFF80000, size=0x100)
 
 for a, (name, cmt) in sorted(LABELS.items()):
