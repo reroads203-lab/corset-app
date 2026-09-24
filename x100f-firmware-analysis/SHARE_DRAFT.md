@@ -64,10 +64,32 @@ decoding each 16KB block independently fails.
 
 ### Tooling
 
-I have a small stdlib-only Python decompressor plus an unpacker that parses the update
-header, undoes the payload bit-inversion, reads the partition table (flash 0x120000 ->
-RAM 0x950000) and writes every partition to its load address. Happy to share or to
-contribute it in whatever form suits the project.
+The core is 20 lines — here it is inline for convenience:
+
+```python
+def decompress(buf):
+    """buf is the whole compressed partition, including the 0x14 header."""
+    out = bytearray()
+    i = 0x14
+    n = len(buf)
+    while i < n:
+        c = buf[i]; i += 1
+        if c < 0x80:                                  # literal run
+            out += buf[i:i + c]; i += c
+        else:                                         # back-reference
+            val = ((c & 0x7F) << 8) | buf[i]; i += 1
+            length = val & 0x0F
+            dist = val >> 4
+            if dist == 0 or length == 0 or dist > len(out):
+                continue
+            for _ in range(length):
+                out.append(out[-dist])
+    return bytes(out)
+```
+
+I also have an unpacker that parses the update header, undoes the payload bit-inversion,
+reads the partition table (flash 0x120000 -> RAM 0x950000) and writes every partition to
+its load address. Happy to share or to contribute it in whatever form suits the project.
 
 I have not touched repacking — the update header checksum is still unsolved for me, and I
 have not modified or flashed anything.
