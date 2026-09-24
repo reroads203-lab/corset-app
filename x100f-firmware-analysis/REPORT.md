@@ -216,15 +216,27 @@ UI の表示文字列は UTF-16LE で、**言語ごとに 256KB（0x40000）ず�
 
 ## 6. スマホ転送と RAF、ファームの改善点
 
-### 6.1 RAF がスマホに送れない件
+### 6.1 Wi-Fi 転送の「縛り」— 半分は設定で外せる
 
-ファーム内に、この挙動の裏付けがある。
+ファーム内の根拠と、実際にできること。
 
 - 拡張子を分類する関数（0x28B4EE4）が `.JPG` `.MPO` `.RAF` `.RAW` `.WAV` を区別している。
-- 無線送信は JPEG を縮小して送る作り（`RESIZEMODE` / `WLANSEND` / `WLANSENDCONFIRM` などの状態名、`RESIZE OK?` の表示）。
 - RAF を選ぶと `RAWファイルです`（警告アイコン付き）を出して弾く文字列がある（UI 文字列 0x18D2B10 付近）。
-- **つまり RAF 転送は仕様として無効化されている。** 実際に転送可否を判定する PTP のオブジェクト処理は圧縮領域（ID5/ID6）側にあり、今回は追い切れなかった。
-- 「改善」するにはこの判定を書き換える（パッチ）必要があるが、(1) 判定コードが圧縮領域にあり展開できていない、(2) チェックサム方式が未解明で再パックできない、(3) 書き換えは起動不能のリスクが高い、の三重の理由で、**現状のファーム改造での RAF 転送有効化は現実的でない**。回避策としては、カメラ内で RAW 現像して JPEG 化してから送る（この機能自体はファーム内にある）か、USB/カードリーダー経由が現実的。
+
+**(a) 3M 縮小はロックではなく設定項目**
+
+- ID5 に `MSG_ITEM_WLAN_3MRESIZE` と `MSG_VALM_3MRESIZE_ON/OFF`・`MSG_VALS_3MRESIZE_ON/OFF` がある。`VALM`/`VALS` はメニューの値表示なので、**ユーザーが ON/OFF できる設定**。
+- **OFF にすればフル解像度の JPEG がそのままスマホへ送られる。** 「必ず縮小される」わけではない（転送は遅くなる）。
+- 関連: `H21_WRN_CANNOT_RESIZE_RAW_F`（RAW はリサイズ不可の警告）。
+
+**(b) RAF をスマホへ送るのは実質不可**
+
+- カメラ側の判定に加え、受け側のスマホアプリが RAF を扱えないため、仮にパッチしても意味が薄い。パッチ自体もチェックサム未解明・文鎮化リスクで非現実的。
+
+**(c) RAW を無線で送るなら PC 保存（PC AutoSave）**
+
+- ファームに独立した PC 保存機能がある: `SERVICE:PCAUTOSAVE/1.0`、`MSG_ITEM_PCSAVE`、`MSG_ITEM_WLAN_PCSAVES`、状態遷移 `PCSAVESEARCH → PCSAVECONNECT → PCSAVESAVING → PCSAVEEND`、画面 `UILIB_SUB_SCR_PC_SAVE_*`。
+- スマホ送信（JPEG 専用・縮小あり）とは**別系統で、PC へのバックアップ経路**。RAW を無線で抜く純正ルートはこちら。
 
 ### 6.2 ファームの古さ（参考・セキュリティ寄りの改善余地）
 
@@ -240,13 +252,116 @@ UI の表示文字列は UTF-16LE で、**言語ごとに 256KB（0x40000）ず�
 
 ---
 
-## 7. やっていないこと・注意
+## 7. 欠陥の体系的な探索（結果は陰性）
+
+「直っていない計算間違いがないか」を、憶測ではなく機械的な検査で調べた。**結論として、欠陥と断定できる箇所は見つからなかった。** 陰性の結果もファームの品質評価として意味があるので残す。
+
+### 7.1 ジャンプテーブルの境界チェック（`tools/jumptable_check.py`）
+
+`cmp rX, #N` → `ldrls pc, [pc, rX, lsl #2]` という分岐表を全領域から抽出し、「N 以下を許すなら表に N+1 個の妥当な飛び先があるか」を検証した。境界が 1 つずれていれば表の外（データ）へ飛ぶ実害のある不具合になる。
+
+| 領域 | 検査したジャンプテーブル | 境界の誤り |
+|---|---|---|
+| メインアプリ | 499 | 0 |
+| ID5 os/lib | 523 | 0 |
+| ID6 code | 1059 | 0 |
+| 合計 | **2081** | **0** |
+
+（1 件の警告は、飛び先の先頭ワードが条件フィールド 0xF を持つ命令だったための判定側の誤検出。）
+
+### 7.2 ゼロ除算・桁あふれの走査（`tools/calcbug_scan.py`）
+
+約 480 万命令を走査し、(1) 除数がゼロ検査されていない除算、(2) 掛け算の結果を 16 ビットへ切り詰めている箇所、を抽出した。生の件数は除算 約 1960 件・切り詰め 約 120 件だが、**大半は文脈を見れば誤検出**。
+
+### 7.3 最有力候補の追跡（結果: 正しく守られていた）
+
+最も疑わしい経路を最後まで追った。
+
+1. 除数を返すアクセサ（0x25DAC88 / 0x25DACE4）が、**範囲外の ID に対して 0 を返す**（`movhi r0, #0` で即リターン）。
+2. 呼び出し元 0x22FC60C はその戻り値で `sdiv` している（ゼロ検査なし）。
+3. → ゼロ除算の疑い。
+
+しかし検証の結果:
+
+- **呼び出し元 0x22FC60C も同じ範囲チェックを自前で行っていた**（0x22FC698: `add r2, r4, #0x1000000` / `cmp r2, #0xABD` / `bhi` で割り算ごと飛ばす）。二重に守られている。
+- 「範囲内でも表の値が 0 なら危険」という残る懸念も、参照先の表（ID1 内 0x341648、12 バイト × 2750 項目）を実際に読み出して確認し、**幅・高さともに 0 の項目は 0 件**だった。
+- アクセサの呼び出し 59 箇所のうち、戻り値で除算しているのはこの 1 関数だけ。
+
+### 7.4 静的解析の限界
+
+断定できない理由は構造的なもの。変数の**正しい値の範囲**が不明（仕様書がない）、**実行して確かめられない**（実機がない）、ソースもシンボルもないため意図が読めない。残る候補を 1 件ずつ潰すことは可能だが、当たりかどうかは最終的に実機での再現が要る。
+
+---
+
+## 8. 設定・機能の棚卸し（実用編）
+
+ファームを書き換えなくても使える情報として、内部の設定項目を抽出した。メニュー項目は全体で **372 個**（`MSG_ITEM_*`）。
+
+### 8.1 フィルムシミュレーションブラケットの 3 枠は指定できる
+
+`MSG_ITEM_FILMBKTSET_FILM1 / FILM2 / FILM3` があり、選択肢として次が並ぶ。
+
+```
+STD(PROVIA) / VELV(Velvia) / SOFT(ASTIA) / CCROME(クラシッククローム)
+NEGAH(PRO Neg.Hi) / NEGAS(PRO Neg.Std) / SEP(セピア)
+MONO + MONOY/MONOR/MONOG(モノクロ＋各フィルター)
+ACROS + ACROSY/ACROSR/ACROSG(ACROS＋各フィルター)
+```
+
+**フィルムシミュレーション BKT で撮る 3 種類を自分で選べる。** 1 回のレリーズで 3 つの味を同時に書き出せるので、レシピ作りの比較に向く。
+
+### 8.2 Fn ボタンに割り当てられる機能（36 種類）
+
+```
+AE / AELOCK / AFAELOCK / AFLOCK / AFON / AFAREA / AFMODE
+FILMSIM / GRAIN / DRNG / WB / ISOAUTO / QUAL / RAW / PIXEL
+NDFILTER / CONVLENS / CONTRING / FNUMCONTROL / SHUTTERTYPE
+FACE_EYE / PINTCHK / FCHECK / EVPREVIEW / EXPPREVIEW / EVFFILM
+TTLLOCK / MODELINGFLASH / STROBE / MICLV / MANNER / TIMER
+OSDLARGE / PLAYMODE / CSET / WLAN / NONE
+```
+
+見落とされがちなもの: **GRAIN**（粒状感の切替）、**CONTRING**（コントロールリングの機能切替）、**TTLLOCK**（調光量ロック）、**EVFFILM**（ファインダーへのフィルムシミュレーション反映）、**OSDLARGE**（Ver.2.10 で追加された大きい表示）。
+
+### 8.3 画面に表示する項目（27 種類、`MSG_ITEM_DSPCUS_*`）
+
+```
+FOCUS / DISTG / DISTGMF(距離指標・MF時距離指標) / HISTGR(ヒストグラム)
+LEVEL(電子水準器) / FRAME / DISPLAYFRAME / TARGETMARK
+DR / EC / EV / AE / WB / FILMSIM / SFISO / DRIVE / RECMODE
+PIXQLTY / TAKENUM(残り枚数) / BTTRY / FLSH / MICLV / MOVIE
+BACKGROUND BLURRING(背景ぼけの目安) / DIGITELECON / CONVLENS
+ELECTRONICSHUTTER
+```
+
+### 8.4 内部の現像パラメータ構造
+
+デバッグ用の状態ダンプ関数（ID6 の 0x14D62D8）が、設定構造体から連続するバイト列を読んで出力している。
+
+```
+ISO      [idx] : 11 個の値
+RAW      [idx] : 11 個の値
+FSIM     [idx] : 11 個の値   ← 構造体オフセット 0xBC06〜0xBC11
+CONTRAST [idx] : 11 個の値   ← 0xBC14〜
+SHARP    [idx] : 11 個の値
+SDW-TONE [idx] : 11 個の値
+```
+
+いずれも**実行時の RAM 上の状態**であり、静的なファームからは既定値表を直接は取り出せなかった。実機のデバッグシリアルが使えれば、この形式で現在値を読み出せる。
+
+### 8.5 おまけ
+
+バッテリー状態のデバッグ出力に `----- Master of Puppets. -----` という一行がある（Metallica の曲名。開発者の遊び心とみられる）。
+
+---
+
+## 9. やっていないこと・注意
 
 - ファームウェアの改変、再パック、書き込みはしていない。再パック用のツールも用意していない。チェックサムが未解明なので、改変したファイルはおそらく受け付けられない。無理に書き込めば起動不能になるおそれが高い。
 - ファームウェア本体と、そこから切り出したバイナリはリポジトリに含めていない（公式サイトから各自ダウンロードする前提）。
 - ダウンロード時に同意する富士フイルムの使用許諾の条件は、各自で確認すること。
 
-## 8. 再現手順
+## 10. 再現手順
 
 ```sh
 pip install numpy capstone          # arm_xrefs.py だけが使う
@@ -255,6 +370,13 @@ python3 tools/x100f_lzss.py  in.lz  out.bin       # 圧縮ブロック単体を�
 python3 tools/arm_xrefs.py out/regions/7_main_app_022fa000.bin 0x022fa000 --str "OSD DEBUG MODE"
 python3 tools/arm_xrefs.py out/regions/7_main_app_022fa000.bin 0x022fa000 --func 0x0231F79C
 python3 tools/arm_xrefs.py out/regions/5_os_lib_compressed_00b51000.bin 0x00b51000 --func 0x00ccddbc
+
+# 欠陥の体系的な探索（7 章）
+python3 tools/jumptable_check.py out/regions
+python3 tools/calcbug_scan.py  out/regions
+
+# 展開済み ID6 を対話的に見る（8 章の調査に使用）
+X100F_REGIONS=out/regions python3 -c "import sys;sys.path.insert(0,'tools');from ana6 import *;print(dis(0x14d62d8,0x14d62f0))"
 ```
 
 手元の Ghidra で開く手順:
